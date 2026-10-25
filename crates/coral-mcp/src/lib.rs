@@ -1,61 +1,86 @@
-//! `MCP` stdio server for Coral.
-//!
-//! This crate adapts the local Coral client from `coral-client` to the
-//! official Rust `MCP` SDK on stdio.
-//!
-//! # Primary Entry Points
-//!
-//! - [`run_stdio_with_client`] serves `MCP` messages on stdio using an
-//!   existing [`coral_client::AppClient`], typically bootstrapped by
-//!   `coral-cli`.
-//!
-//! The exposed MCP surface is intentionally small:
-//!
-//! - tools: `sql`, paginated `list_catalog`, `search_catalog`, `describe_table`, `list_columns`, and optionally `feedback`
-//! - resources: `coral://guide`, `coral://tables`
-//!
-//! Protocol lifecycle, initialization, and stdio transport behavior should stay
-//! inside the SDK integration rather than being reimplemented locally.
+//! Workspace Streamable HTTP Adapter. Authentication fixes a canonical Principal
+//! on every HTTP request; domain Modules own current authority and visibility.
+//! MCP session identifiers and client metadata never grant authority.
 
-#![allow(
-    unused_crate_dependencies,
-    reason = "Library test targets inherit package dependencies that are consumed by sibling targets."
-)]
-
-mod error;
+mod arguments;
+mod authentication;
+mod http;
+mod instructions;
+mod projection;
+mod prompts;
 mod server;
-mod surface;
-mod telemetry;
+mod urls;
 
 #[cfg(test)]
-mod tests;
+use {
+    coral_catalog as _, coral_policy as _, coral_provider as _, coral_test_support as _,
+    jsonschema as _, opentelemetry as _, opentelemetry_sdk as _, reqwest as _, tracing as _,
+    tracing_opentelemetry as _, tracing_subscriber as _,
+};
 
-use coral_client::AppClient;
-use rmcp::ServiceExt;
+use std::num::NonZeroUsize;
 
-pub use error::McpError;
-pub(crate) use server::CoralMcpServer;
+use coral_run::RunModule;
+use coral_task::{TaskCommands, TaskModule};
+use coral_workspace::{AuthenticatedPrincipal, WorkspaceModule};
 
-/// Optional MCP surface features.
-#[derive(Debug, Clone, Default)]
-pub struct McpOptions {
-    /// Expose the feedback submission tool.
-    pub feedback_enabled: bool,
-    /// Optional W3C traceparent used to parent each MCP request span.
-    pub trace_parent: Option<String>,
+pub use authentication::{AuthenticationError, OauthProtectedResource, WorkspaceAuthenticator};
+pub use coral_run::{HumanInterfaceUrl, HumanInterfaceUrlError};
+pub use http::{
+    McpHttpConfig, McpHttpError, ReadinessProbe, RunningMcpHttpServer, start_authenticated,
+    start_local,
+};
+pub use server::SUPPORTED_PROTOCOL_VERSIONS;
+pub use urls::{WORKSPACE_MCP_ROUTE, parse_workspace_mcp_path, workspace_mcp_path};
+
+/// Default target size of one encoded `exec`, `wait` or `cancel` result.
+const RUN_UPDATE_PAGE_BYTES: NonZeroUsize =
+    NonZeroUsize::new(64 << 20).expect("the default page target is positive");
+
+/// Domain Modules required by the MCP Adapter, independent of authentication mode,
+/// and the projection settings: the human interface where projections send
+/// people to act, and the Run Update page target.
+#[derive(Clone)]
+pub struct McpModules {
+    pub(crate) workspaces: WorkspaceModule,
+    pub(crate) tasks: TaskModule,
+    pub(crate) commands: TaskCommands,
+    pub(crate) runs: RunModule,
+    pub(crate) human_interface: HumanInterfaceUrl,
+    pub(crate) run_update_page_bytes: NonZeroUsize,
+}
+impl McpModules {
+    /// Receives initialized Modules, including Task commands assembled by bootstrap.
+    #[must_use]
+    pub const fn new(
+        workspaces: WorkspaceModule,
+        tasks: TaskModule,
+        commands: TaskCommands,
+        runs: RunModule,
+        human_interface: HumanInterfaceUrl,
+    ) -> Self {
+        Self {
+            workspaces,
+            tasks,
+            commands,
+            runs,
+            human_interface,
+            run_update_page_bytes: RUN_UPDATE_PAGE_BYTES,
+        }
+    }
+
+    /// Selects the target size of one encoded `exec`, `wait` or `cancel`
+    /// result. Pages fill up to it; paging never splits a value, so a single
+    /// larger output item or terminal outcome arrives whole on its own page.
+    #[must_use]
+    pub const fn with_run_update_page_bytes(mut self, bytes: NonZeroUsize) -> Self {
+        self.run_update_page_bytes = bytes;
+        self
+    }
 }
 
-/// Runs the `MCP` stdio server using an existing Coral client.
-///
-/// # Errors
-///
-/// Returns [`McpError`] if the stdio server cannot complete its `MCP`
-/// lifecycle.
-pub async fn run_stdio_with_client(app: AppClient, options: McpOptions) -> Result<(), McpError> {
-    let server = Box::pin(
-        CoralMcpServer::new(&app, options).serve((tokio::io::stdin(), tokio::io::stdout())),
-    )
-    .await?;
-    let _ = server.waiting().await?;
-    Ok(())
+#[derive(Clone)]
+pub(crate) struct McpRuntime {
+    modules: McpModules,
+    principal: AuthenticatedPrincipal,
 }

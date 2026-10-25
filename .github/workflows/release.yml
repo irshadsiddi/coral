@@ -1,339 +1,621 @@
 name: Release
+
+# Builds, signs and publishes Desktop to the v1 update feed, and the runtime
+# and coral-web images to GHCR, as one release: no artifact is visible until
+# every artifact is verified. Each Desktop platform job compiles and stages
+# with no credentials, then hands the staged build to xtask, which owns
+# packaging, signing, notarization and verification. Every Desktop asset goes
+# to a draft release in the feed repository, which updaters ignore. The images
+# are pushed by digest only, which no tag reaches. The promote job publishes
+# the release whole: it tags the images, then publishes the draft.
+#
+# The feed never lives in withcoral/coral, whose releases the 0.x app
+# polls. docs/adr/0013-desktop-release-channel.md records the decision.
+#
+# Merging the release-please PR is the approval. release-please then publishes
+# a release here, which starts this workflow; everything after it runs by
+# itself. To retry a failed run, dispatch it on the release tag (vX.Y.Z or
+# vX.Y.Z-beta.N) in the ref picker.
+#
+# The public docs site builds from the long-lived `docs` branch, which the
+# docs job points at the newest shipped release once promote has published
+# it. A merge to main therefore changes nothing on the site until a release
+# ships, and the branch only ever moves forward.
 on:
   release:
     types: [published]
   workflow_dispatch:
-    inputs:
-      tag:
-        description: "Existing tag to (re)build and upload artifacts for (e.g. v0.1.4)"
-        required: true
-        type: string
+
 permissions:
   contents: read
+
+# One run per tag. A shared group would keep only one pending run, so a
+# second tag published during a release would silently replace the first's.
 concurrency:
-  group: release
+  group: release-${{ github.event.release.tag_name || github.ref_name }}
   cancel-in-progress: false
 
-jobs:
-  build-ui:
-    runs-on: ubuntu-latest
-    env:
-      TAG_NAME: ${{ github.event.release.tag_name || inputs.tag }}
-    outputs:
-      has-ui: ${{ steps.detect-ui.outputs.has-ui }}
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-        with:
-          ref: ${{ env.TAG_NAME }}
-          persist-credentials: false
-      - name: Detect UI package
-        id: detect-ui
-        run: |
-          if [ -f ui/package.json ]; then
-            echo "has-ui=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "has-ui=false" >> "$GITHUB_OUTPUT"
-          fi
-      - name: Set up Node
-        if: steps.detect-ui.outputs.has-ui == 'true'
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
-        with:
-          node-version-file: ui/.node-version
-          package-manager-cache: false
-      - name: Install UI dependencies
-        if: steps.detect-ui.outputs.has-ui == 'true'
-        run: npm ci --prefix ui
-      - name: Build UI
-        if: steps.detect-ui.outputs.has-ui == 'true'
-        run: npm run build --prefix ui
-      - name: Verify UI entrypoint
-        if: steps.detect-ui.outputs.has-ui == 'true'
-        run: test -s ui/dist/index.html
-      - name: Upload UI artifact
-        if: steps.detect-ui.outputs.has-ui == 'true'
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
-        with:
-          name: ui-dist
-          path: ui/dist
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # Must match UPDATE_FEED in apps/desktop/electron-builder.config.ts. xtask
+  # fails a package whose app-update.yml names another feed.
+  DESKTOP_FEED_OWNER: withcoral
+  DESKTOP_FEED_NAME: coral-releases
 
-  build:
-    needs: build-ui
-    strategy:
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
-            cross: true
-          - target: x86_64-apple-darwin
-            os: macos-latest
-          - target: aarch64-apple-darwin
-            os: macos-latest
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-    runs-on: ${{ matrix.os }}
+# No Rust or npm caches: a release compiles from a clean state, so a poisoned
+# cache cannot reach a signed build.
+jobs:
+  validate:
+    name: Validate the release tag
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 20
     env:
-      TAG_NAME: ${{ github.event.release.tag_name || inputs.tag }}
+      TAG_NAME: ${{ github.event.release.tag_name || github.ref_name }}
+    outputs:
+      commit-sha: ${{ steps.ref.outputs.commit-sha }}
+      tag-name: ${{ steps.ref.outputs.tag-name }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-        with:
-          ref: ${{ env.TAG_NAME }}
-          persist-credentials: false
-      - name: Install Rust toolchain
-        run: rustup show
-      - name: Ensure target is installed
-        run: rustup target add ${{ matrix.target }}
-      - name: Download UI artifact
-        if: needs.build-ui.outputs.has-ui == 'true'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          name: ui-dist
-          path: ui/dist
-      # No Rust cache here — release builds must compile from a clean state
-      # to guard against cache poisoning attacks.
-      - name: Install cross
-        if: matrix.cross
+      - name: Require a release tag ref
         run: |
           set -euo pipefail
-          cargo install cargo-binstall --locked
-          cargo binstall --no-confirm --force --disable-strategies compile cross@0.2.5
-      - name: Build Unix
-        if: runner.os != 'Windows'
-        shell: bash
-        env:
-          CROSS: ${{ matrix.cross }}
-          HAS_UI: ${{ needs.build-ui.outputs.has-ui }}
-          TARGET: ${{ matrix.target }}
-        run: |
-          feature_args=()
-          if [ "$HAS_UI" = "true" ]; then
-            feature_args=(--features embedded-ui)
+          if [[ ! "$TAG_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "A release tag looks like vX.Y.Z or vX.Y.Z-beta.N, not '${TAG_NAME}'." >&2
+            exit 1
+          fi
+          if [ "$GITHUB_REF" != "refs/tags/${TAG_NAME}" ]; then
+            echo "Run this workflow on refs/tags/${TAG_NAME}, not ${GITHUB_REF}." >&2
+            exit 1
           fi
 
-          if [ "$CROSS" = "true" ]; then
-            cross build --locked --release --target "$TARGET" "${feature_args[@]}"
-          else
-            cargo build --locked --release --target "$TARGET" "${feature_args[@]}"
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ env.TAG_NAME }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Require the tag on main
+        id: ref
+        run: |
+          set -euo pipefail
+          # fetch-depth: 0 already fetched origin/main. A fetch here would
+          # need credentials, which checkout does not keep.
+          tag_commit="$(git rev-parse "${TAG_NAME}^{commit}")"
+          if ! git merge-base --is-ancestor "$tag_commit" origin/main; then
+            echo "${TAG_NAME} (${tag_commit}) is not on main." >&2
+            exit 1
           fi
+          echo "commit-sha=${tag_commit}" >> "$GITHUB_OUTPUT"
+          echo "tag-name=${TAG_NAME}" >> "$GITHUB_OUTPUT"
 
-      - name: Build Windows
-        if: runner.os == 'Windows'
-        shell: pwsh
-        env:
-          HAS_UI: ${{ needs.build-ui.outputs.has-ui }}
-          TARGET: ${{ matrix.target }}
+      - name: Install Rust toolchain
+        run: rustup show
+
+      - name: Require the tag, the runtime and Desktop to agree
         run: |
-          $featureArgs = @()
-          if ($env:HAS_UI -eq "true") {
-            $featureArgs += @("--features", "embedded-ui")
-          }
+          set -euo pipefail
+          cargo run --locked -p xtask -- release-desktop-check-version --tag "$TAG_NAME"
 
-          cargo build --locked --release --target $env:TARGET @featureArgs
-
-      - name: Smoke Windows release binary
-        if: runner.os == 'Windows'
-        shell: pwsh
-        env:
-          TARGET: ${{ matrix.target }}
-        run: |
-          $coral = "target\$env:TARGET\release\coral.exe"
-          & $coral --version
-          & $coral source discover
-
-      - name: Package Unix
-        if: runner.os != 'Windows'
-        shell: bash
-        env:
-          TARGET: ${{ matrix.target }}
-        run: |
-          archive="coral-${TARGET}.tar.gz"
-          cd "target/${TARGET}/release"
-          tar czf "../../../${archive}" coral
-          cd ../../../
-
-      - name: Package Windows
-        if: runner.os == 'Windows'
-        shell: pwsh
-        env:
-          TARGET: ${{ matrix.target }}
-        run: |
-          $staging = "package-$env:TARGET"
-          New-Item -ItemType Directory -Force -Path $staging | Out-Null
-          Copy-Item "target\$env:TARGET\release\coral.exe" "$staging\coral.exe"
-          Push-Location $staging
-          Compress-Archive -Path coral.exe -DestinationPath "..\coral-$env:TARGET.zip" -Force
-          Pop-Location
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
-        with:
-          name: coral-${{ matrix.target }}
-          path: |
-            coral-${{ matrix.target }}.tar.gz
-            coral-${{ matrix.target }}.zip
-
-  checksums:
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          pattern: coral-*
-          path: artifacts
-          merge-multiple: true
-      - name: Generate checksums
-        run: |
-          cd artifacts
-          sha256sum coral-*.tar.gz > checksums.sha256
-          sha256sum coral-*.zip >> checksums.sha256
-          test -s checksums.sha256
-      - name: Upload checksums
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
-        with:
-          name: checksums
-          path: artifacts/checksums.sha256
-
-  publish-version:
-    needs: checksums
+  package-macos:
+    name: Package, sign and notarize for macOS
+    needs: validate
+    runs-on: blacksmith-6vcpu-macos-26
     environment: release
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
+    timeout-minutes: 120
     env:
-      TAG_NAME: ${{ github.event.release.tag_name || inputs.tag }}
+      TAG_NAME: ${{ needs.validate.outputs.tag-name }}
     steps:
-      - name: Download artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          pattern: "{coral-*,checksums}"
-          path: artifacts
+          ref: ${{ needs.validate.outputs.commit-sha }}
+          persist-credentials: false
+
+      - name: Install Rust toolchain and the Apple silicon target
+        run: |
+          rustup show
+          rustup target add aarch64-apple-darwin
+
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version-file: apps/desktop/.node-version
+          package-manager-cache: false
+
+      - run: npm ci --prefix apps/reef
+      - run: npm ci --prefix apps/desktop
+
+      # Everything that compiles or runs package scripts runs here, before any
+      # credential enters the environment.
+      - name: Stage the runtime and Reef, and build Desktop
+        run: |
+          npm run stage --prefix apps/desktop
+          npm run build --prefix apps/desktop
+      - name: Build xtask
+        run: cargo build --locked -p xtask
+
+      - name: Package, sign, notarize and verify
+        env:
+          APPLE_CODESIGN_IDENTITY: ${{ secrets.APPLE_CODESIGN_IDENTITY }}
+          APPLE_DEVELOPER_ID_CERTIFICATE_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_CERTIFICATE_BASE64 }}
+          APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD }}
+          APP_STORE_CONNECT_API_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
+          APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          APP_STORE_CONNECT_API_KEY_P8_BASE64: ${{ secrets.APP_STORE_CONNECT_API_KEY_P8_BASE64 }}
+        run: |
+          ./target/debug/xtask release-desktop-package --platform mac \
+            --tag "$TAG_NAME" --feed-repo "$DESKTOP_FEED_OWNER/$DESKTOP_FEED_NAME" \
+            --work-dir "$RUNNER_TEMP/coral-desktop-signing" --out release-assets
+
+      # xtask removes the keychain itself, unless the runner killed it first.
+      - name: Remove the signing keychain
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/coral-desktop-signing/coral-signing.keychain-db" || true
+          rm -rf "$RUNNER_TEMP/coral-desktop-signing"
+
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: desktop-macos
+          path: release-assets/
+          if-no-files-found: error
+
+  package-windows:
+    name: Package and sign for Windows
+    needs: validate
+    runs-on: blacksmith-4vcpu-windows-2025
+    environment: release
+    timeout-minutes: 150
+    env:
+      TAG_NAME: ${{ needs.validate.outputs.tag-name }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ needs.validate.outputs.commit-sha }}
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: rustup show
+
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version-file: apps/desktop/.node-version
+          package-manager-cache: false
+
+      - run: npm ci --prefix apps/reef
+      - run: npm ci --prefix apps/desktop
+
+      - name: Stage the runtime and Reef, and build Desktop
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $true
+          npm run stage --prefix apps/desktop
+          npm run build --prefix apps/desktop
+      - name: Build xtask
+        run: cargo build --locked -p xtask
+
+      - name: Package, sign and verify
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_TRUSTED_SIGNING_ENDPOINT: ${{ vars.AZURE_TRUSTED_SIGNING_ENDPOINT }}
+          AZURE_TRUSTED_SIGNING_ACCOUNT_NAME: ${{ vars.AZURE_TRUSTED_SIGNING_ACCOUNT_NAME }}
+          AZURE_TRUSTED_SIGNING_CERTIFICATE_PROFILE_NAME: ${{ vars.AZURE_TRUSTED_SIGNING_CERTIFICATE_PROFILE_NAME }}
+          AZURE_TRUSTED_SIGNING_PUBLISHER_NAME: ${{ vars.AZURE_TRUSTED_SIGNING_PUBLISHER_NAME }}
+        run: |
+          ./target/debug/xtask release-desktop-package --platform win `
+            --tag $env:TAG_NAME --feed-repo "$env:DESKTOP_FEED_OWNER/$env:DESKTOP_FEED_NAME" `
+            --out release-assets
+
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: desktop-windows
+          path: release-assets/
+          if-no-files-found: error
+
+  # The AppImage is unsigned, so this job needs no credentials.
+  package-linux:
+    name: Package for Linux
+    needs: validate
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 60
+    env:
+      TAG_NAME: ${{ needs.validate.outputs.tag-name }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ needs.validate.outputs.commit-sha }}
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        run: rustup show
+
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version-file: apps/desktop/.node-version
+          package-manager-cache: false
+
+      - run: npm ci --prefix apps/reef
+      - run: npm ci --prefix apps/desktop
+
+      - name: Stage the runtime and Reef, and build Desktop
+        run: |
+          npm run stage --prefix apps/desktop
+          npm run build --prefix apps/desktop
+      - name: Build xtask
+        run: cargo build --locked -p xtask
+
+      - name: Package and verify
+        run: |
+          ./target/debug/xtask release-desktop-package --platform linux \
+            --tag "$TAG_NAME" --feed-repo "$DESKTOP_FEED_OWNER/$DESKTOP_FEED_NAME" \
+            --out release-assets
+
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: desktop-linux
+          path: release-assets/
+          if-no-files-found: error
+
+  # Uploads every platform's assets to a draft. A rerun replaces them. The
+  # draft waits for the images too, so a release that cannot ship whole stops
+  # here, before anything is visible.
+  draft:
+    name: Draft the release in the feed
+    needs: [validate, package-macos, package-windows, package-linux, images]
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    environment: release
+    timeout-minutes: 30
+    env:
+      TAG_NAME: ${{ needs.validate.outputs.tag-name }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ needs.validate.outputs.commit-sha }}
+          persist-credentials: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: desktop-*
+          path: release-assets
           merge-multiple: true
 
-      - name: Create GitHub App token
+      - name: Install Rust toolchain
+        run: rustup show
+      - name: Build xtask
+        run: cargo build --locked -p xtask
+
+      - name: Create a GitHub App token for the feed
+        id: token
         uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859 # v3.0.0
-        id: github-app-token
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ env.DESKTOP_FEED_OWNER }}
+          repositories: ${{ env.DESKTOP_FEED_NAME }}
+          permission-contents: write
+
+      # release-please wrote the notes on this repository's release, which
+      # started this run. The feed token reaches only the feed repository.
+      - name: Read the release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release view "$TAG_NAME" --repo "$GITHUB_REPOSITORY" --json body --jq .body \
+            > "$RUNNER_TEMP/release-notes.md"
+
+      - name: Upload the verified assets to a draft
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+        run: |
+          set -euo pipefail
+          args=(--tag "$TAG_NAME" --feed-repo "$DESKTOP_FEED_OWNER/$DESKTOP_FEED_NAME" --assets release-assets)
+          args+=(--notes-file "$RUNNER_TEMP/release-notes.md")
+          ./target/debug/xtask release-desktop-publish "${args[@]}"
+
+  # Anyone sees the release only from here. It runs once the draft holds every
+  # platform's assets and the images are tested and signed, so neither an
+  # updater nor a docker pull sees a partial release. The images are tagged
+  # before the draft is published: a rerun repairs a draft, but
+  # release-desktop-publish refuses a release that is already published, so
+  # the step a rerun cannot redo runs last.
+  promote:
+    name: Publish the release to updaters and registries
+    needs: [validate, draft, images]
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    environment: release
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    env:
+      TAG_NAME: ${{ needs.validate.outputs.tag-name }}
+      CORAL_IMAGE: ghcr.io/withcoral/coral
+      CORAL_WEB_IMAGE: ghcr.io/withcoral/coral-web
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ needs.validate.outputs.commit-sha }}
+          persist-credentials: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          pattern: desktop-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Install Rust toolchain
+        run: rustup show
+      - name: Build xtask
+        run: cargo build --locked -p xtask
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Every release publishes its exact version tag. A stable release moves
+      # X.Y when it is the newest in its line, and latest when it is the newest
+      # overall, so a beta never becomes the image people pull by default and
+      # a rerun of an older tag never moves an alias backwards.
+      - name: Tag the tested images
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.images.outputs.version }}
+          CORAL_DIGEST: ${{ needs.images.outputs.coral }}
+          CORAL_WEB_DIGEST: ${{ needs.images.outputs.coral-web }}
+        run: |
+          set -euo pipefail
+          tags=("$VERSION")
+          if [[ "$VERSION" != *-* ]]; then
+            line="${VERSION%.*}"
+            stable="$( { gh release list --repo "$GITHUB_REPOSITORY" --exclude-pre-releases \
+              --exclude-drafts --limit 1000 --json tagName --jq '.[].tagName'; echo "$TAG_NAME"; } \
+              | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -uV)"
+            if [ "$(grep -E "^v${line//./\\.}\\." <<<"$stable" | tail -1)" = "$TAG_NAME" ]; then tags+=("$line"); fi
+            if [ "$(tail -1 <<<"$stable")" = "$TAG_NAME" ]; then tags+=(latest); fi
+          fi
+          echo "Tagging ${tags[*]}"
+          for pair in "${CORAL_IMAGE}@${CORAL_DIGEST}" "${CORAL_WEB_IMAGE}@${CORAL_WEB_DIGEST}"; do
+            image="${pair%@*}"
+            args=()
+            for tag in "${tags[@]}"; do args+=(--tag "${image}:${tag}"); done
+            docker buildx imagetools create "${args[@]}" "$pair"
+            # The tag must resolve to the digest that was tested and signed. A
+            # manifest's digest is the hash of its raw bytes, which every buildx
+            # version returns the same way.
+            tagged="sha256:$(docker buildx imagetools inspect --raw "${image}:${VERSION}" | sha256sum | cut -d' ' -f1)"
+            if [ "$tagged" != "${pair#*@}" ]; then
+              echo "${image}:${VERSION} resolves to ${tagged}, not the signed ${pair#*@}." >&2
+              exit 1
+            fi
+          done
+
+      - name: Create a GitHub App token for the feed
+        id: token
+        uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859 # v3.0.0
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ env.DESKTOP_FEED_OWNER }}
+          repositories: ${{ env.DESKTOP_FEED_NAME }}
+          permission-contents: write
+
+      - name: Publish the complete draft
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+        run: |
+          set -euo pipefail
+          args=(--tag "$TAG_NAME" --feed-repo "$DESKTOP_FEED_OWNER/$DESKTOP_FEED_NAME" --assets release-assets)
+          ./target/debug/xtask release-desktop-promote "${args[@]}"
+
+  # The public docs site builds from the `docs` branch. This job points it at
+  # the newest shipped release once promote has published it. It also runs
+  # when promote is skipped, which is what a manual dispatch of an already
+  # shipped tag does: release-desktop-publish refuses the published feed
+  # release, so draft fails and promote never runs. The job then reads the
+  # feed itself to tell a shipped release from an unfinished one.
+  docs:
+    name: Point the docs branch at the newest shipped release
+    needs: [validate, promote]
+    if: >-
+      ${{ !cancelled()
+      && needs.validate.result == 'success'
+      && (needs.promote.result == 'success' || needs.promote.result == 'skipped') }}
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    environment: release
+    timeout-minutes: 10
+    # Release runs are grouped per tag, so two tags can reach this job at
+    # once. No shared concurrency group serializes them: a group keeps one
+    # pending job and cancels it when another arrives, so a rerun of an old
+    # tag could drop the docs job of a release that shipped. Their pushes
+    # still cannot cross. The decide step below lets only the newest
+    # published release push, and reads that seconds before the push, while
+    # a newer release takes far longer than that to ship.
+    permissions:
+      contents: read
+    env:
+      TAG_NAME: ${{ needs.validate.outputs.tag-name }}
+      RELEASE_COMMIT_SHA: ${{ needs.validate.outputs.commit-sha }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ needs.validate.outputs.commit-sha }}
+          persist-credentials: false
+
+      - name: Create a GitHub App token for the feed
+        id: feed-token
+        uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859 # v3.0.0
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ env.DESKTOP_FEED_OWNER }}
+          repositories: ${{ env.DESKTOP_FEED_NAME }}
+          permission-contents: read
+
+      # Shipped means the feed release is published: promote just did that, or
+      # an earlier run did. A draft or missing feed release is an unfinished
+      # release whose rerun is still repairing it, and the branch stays put.
+      # The branch also only moves forward: a tag that is not the newest
+      # published release here leaves it alone, so neither a late-finishing
+      # older run nor a rerun of an old tag can roll the site back.
+      - name: Decide whether this release moves the docs branch
+        id: decide
+        env:
+          FEED_TOKEN: ${{ steps.feed-token.outputs.token }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # As in xtask's desktop_release: only "release not found" means the
+          # release is missing. A token or API failure stops the run, so the
+          # branch is never left behind by a green run.
+          feed_error="$RUNNER_TEMP/feed-release.err"
+          if ! draft="$(GH_TOKEN="$FEED_TOKEN" gh release view "$TAG_NAME" \
+              --repo "$DESKTOP_FEED_OWNER/$DESKTOP_FEED_NAME" --json isDraft --jq .isDraft 2>"$feed_error")"; then
+            if ! grep -q 'release not found' "$feed_error"; then
+              echo "Reading ${TAG_NAME} in ${DESKTOP_FEED_OWNER}/${DESKTOP_FEED_NAME} failed:" >&2
+              cat "$feed_error" >&2
+              exit 1
+            fi
+            draft=missing
+          fi
+          if [ "$draft" != false ]; then
+            echo "::notice title=Docs branch unchanged::${TAG_NAME} is not published in the feed (isDraft: ${draft}); the docs branch stays where it is"
+            echo "push=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          newest="$(gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts --limit 1 --json tagName --jq '.[0].tagName')"
+          if [ "$newest" != "$TAG_NAME" ]; then
+            echo "::notice title=Docs branch unchanged::${newest} is the newest published release; ${TAG_NAME} does not move the docs branch"
+            echo "push=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "push=true" >> "$GITHUB_OUTPUT"
+
+      # The feed token is scoped to the feed repository; the docs branch lives
+      # here, so the push needs a token for this repository.
+      - name: Create a GitHub App token for the docs branch
+        if: ${{ steps.decide.outputs.push == 'true' }}
+        id: docs-token
+        uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859 # v3.0.0
         with:
           app-id: ${{ vars.RELEASE_APP_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
           permission-contents: write
-          repositories: |
-            coral
-            homebrew-tap
 
-      - name: Upload artifacts to GitHub release
+      # Force push targets `docs` only, never `main`. The commit is already on
+      # origin as the release tag, so the shallow checkout above has everything
+      # the push needs.
+      - name: Point the docs branch at the released commit
+        if: ${{ steps.decide.outputs.push == 'true' }}
         env:
-          GH_TOKEN: ${{ steps.github-app-token.outputs.token }}
+          GH_APP_TOKEN: ${{ steps.docs-token.outputs.token }}
         run: |
           set -euo pipefail
-          shopt -s nullglob
-          artifacts=(artifacts/coral-*.tar.gz artifacts/coral-*.zip artifacts/checksums.sha256)
-          if [ "${#artifacts[@]}" -lt 2 ]; then
-            echo "No Coral release archives found" >&2
-            exit 1
-          fi
-          gh release upload "$TAG_NAME" \
-            "${artifacts[@]}" \
-            --repo "$GITHUB_REPOSITORY" \
-            --clobber
-
-      - name: Promote GitHub release
-        id: promote-release
-        env:
-          GH_TOKEN: ${{ steps.github-app-token.outputs.token }}
-        run: |
-          set -euo pipefail
-          release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG_NAME}")"
-          release_id="$(printf '%s' "$release_json" | jq -r '.id')"
-          was_prerelease="$(printf '%s' "$release_json" | jq -r '.prerelease')"
-
-          if [ "$was_prerelease" = "true" ]; then
-            release_json="$(gh api \
-              --method PATCH \
-              "repos/${GITHUB_REPOSITORY}/releases/${release_id}" \
-              -F prerelease=false \
-              -F make_latest=true)"
-          fi
-
-          {
-            echo "was_prerelease=${was_prerelease}"
-            echo "tag_name=$(printf '%s' "$release_json" | jq -r '.tag_name')"
-            echo "release_name=$(printf '%s' "$release_json" | jq -r '.name // ""')"
-            echo "release_url=$(printf '%s' "$release_json" | jq -r '.html_url')"
-            echo "body<<__RELEASE_BODY__"
-            printf '%s' "$release_json" | jq -r '.body // ""'
-            echo "__RELEASE_BODY__"
-          } >> "$GITHUB_OUTPUT"
-
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-        with:
-          ref: ${{ env.TAG_NAME }}
-          fetch-depth: 0
-          token: ${{ steps.github-app-token.outputs.token }}
-          persist-credentials: false
-
-      # Force push targets `docs` only — never `main`. Runs on both the
-      # `release` event and manual `workflow_dispatch` against a tag, so docs
-      # can be (re)pointed at a shipped tag by re-running this workflow.
-      - name: Point docs branch at released commit
-        env:
-          GH_APP_TOKEN: ${{ steps.github-app-token.outputs.token }}
-        run: |
-          set -euo pipefail
-          released_commit="$(git rev-parse "${TAG_NAME}^{commit}")"
           git push --force \
             "https://x-access-token:${GH_APP_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
-            "${released_commit}:refs/heads/docs"
+            "${RELEASE_COMMIT_SHA}:refs/heads/docs"
 
-      # Dispatch the tap workflow after publishing the release:
-      # https://octokit.github.io/rest.js/v22/#repos-create-dispatch-event
-      - name: Trigger Homebrew tap bump
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
-        env:
-          RELEASE_VERSION: ${{ env.TAG_NAME }}
+  # The images keep the product's names, ghcr.io/withcoral/coral and
+  # ghcr.io/withcoral/coral-web. This job is the images' counterpart of the
+  # platform package jobs: it builds, tests and signs, and hands the digests to
+  # promote, which tags them. A rerun rebuilds, and promote retags the version.
+  images:
+    name: Build, test and sign the runtime and coral-web images
+    needs: validate
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    environment: release
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+      # cosign signs keylessly with the workflow's identity.
+      id-token: write
+    outputs:
+      version: ${{ steps.build.outputs.version }}
+      coral: ${{ steps.build.outputs.coral }}
+      coral-web: ${{ steps.build.outputs.coral-web }}
+    env:
+      TAG_NAME: ${{ needs.validate.outputs.tag-name }}
+      COMMIT_SHA: ${{ needs.validate.outputs.commit-sha }}
+      CORAL_IMAGE: ghcr.io/withcoral/coral
+      CORAL_WEB_IMAGE: ghcr.io/withcoral/coral-web
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          github-token: ${{ steps.github-app-token.outputs.token }}
-          script: |
-            const version = process.env.RELEASE_VERSION.replace(/^v/, "");
-            await github.rest.repos.createDispatchEvent({
-              owner: "withcoral",
-              repo: "homebrew-tap",
-              event_type: "coral-release",
-              client_payload: { version },
-            });
+          ref: ${{ needs.validate.outputs.commit-sha }}
+          persist-credentials: false
 
-      - name: Post promoted release to Discord
-        if: steps.promote-release.outputs.was_prerelease == 'true'
-        env:
-          DISCORD_WEBHOOK: ${{ secrets.DISCORD_CHANGELOG_WEBHOOK }}
-          TAG_NAME: ${{ steps.promote-release.outputs.tag_name }}
-          RELEASE_NAME: ${{ steps.promote-release.outputs.release_name }}
-          RELEASE_BODY: ${{ steps.promote-release.outputs.body }}
-          RELEASE_URL: ${{ steps.promote-release.outputs.release_url }}
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # A new builder per run, so the Dockerfile's cache mounts start empty.
+      - uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+        with:
+          cache-binary: false
+
+      # Untagged until the tests pass: a digest-only push is invisible to
+      # anyone pulling by tag.
+      - name: Build and push both images by digest
+        id: build
         run: |
-          MAX_LEN=3500
-          BODY="$RELEASE_BODY"
-          if [ ${#BODY} -gt $MAX_LEN ]; then
-            BODY="${BODY:0:$MAX_LEN}..."
-          fi
+          set -euo pipefail
+          version="${TAG_NAME#v}"
+          notes="Release notes: https://github.com/withcoral/coral/releases/tag/${TAG_NAME}"
+          # --provenance pushes an index, and GHCR reads a package description
+          # only from the index's annotations, never from image labels. The
+          # annotation is set here because promote must tag the signed digest.
+          build() {
+            local image="$1"
+            shift
+            docker buildx build --platform linux/amd64 --provenance=true "$@" \
+              --output "type=image,name=${image},push-by-digest=true,name-canonical=true,push=true" \
+              --metadata-file "$RUNNER_TEMP/build.json" . >&2
+            jq -er '."containerimage.digest"' "$RUNNER_TEMP/build.json"
+          }
+          coral="$(build "$CORAL_IMAGE" --file docker/Dockerfile \
+            --build-arg "CORAL_GIT_SHA=$(git rev-parse --short HEAD)" \
+            --label "org.opencontainers.image.source=https://github.com/withcoral/coral" \
+            --label "org.opencontainers.image.version=${version}" \
+            --label "org.opencontainers.image.revision=${COMMIT_SHA}" \
+            --annotation "index:org.opencontainers.image.description=Coral runtime ${version}. ${notes}")"
+          coral_web="$(build "$CORAL_WEB_IMAGE" --file docker/Dockerfile.reef \
+            --build-arg "CORAL_WEB_VERSION=${version}" \
+            --build-arg "CORAL_WEB_REVISION=${COMMIT_SHA}" \
+            --annotation "index:org.opencontainers.image.description=Coral Web ${version}. ${notes}")"
+          {
+            echo "version=${version}"
+            echo "coral=${coral}"
+            echo "coral-web=${coral_web}"
+          } >> "$GITHUB_OUTPUT"
 
-          TITLE_MAX_LEN=256
-          TITLE="🪸 ${RELEASE_NAME:-$TAG_NAME}"
-          if [ ${#TITLE} -gt $TITLE_MAX_LEN ]; then
-            TITLE="${TITLE:0:$((TITLE_MAX_LEN - 3))}..."
-          fi
+      # Runs the runtime, coral-web, and the pair with coral-web in the runtime's
+      # network namespace, against the pushed digests.
+      - name: Test the images alone and together
+        env:
+          CORAL_DIGEST: ${{ steps.build.outputs.coral }}
+          CORAL_WEB_DIGEST: ${{ steps.build.outputs.coral-web }}
+        run: |
+          CORAL_IMAGE="${CORAL_IMAGE}@${CORAL_DIGEST}" \
+            CORAL_WEB_IMAGE="${CORAL_WEB_IMAGE}@${CORAL_WEB_DIGEST}" \
+            docker/image-test.sh
 
-          jq -n \
-            --arg title "$TITLE" \
-            --arg desc "$BODY" \
-            --arg url "$RELEASE_URL" \
-            '{
-              embeds: [{
-                title: $title,
-                description: $desc,
-                url: $url,
-                color: 16744272,
-                footer: { text: "Fresh from the reef" }
-              }]
-            }' | curl -sf -H "Content-Type: application/json" -d @- "$DISCORD_WEBHOOK"
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      # The signature covers the digest, so the tags promote adds later point
+      # at signed content without signing again.
+      - name: Sign both images
+        env:
+          CORAL_DIGEST: ${{ steps.build.outputs.coral }}
+          CORAL_WEB_DIGEST: ${{ steps.build.outputs.coral-web }}
+        run: |
+          set -euo pipefail
+          cosign sign --yes "${CORAL_IMAGE}@${CORAL_DIGEST}"
+          cosign sign --yes "${CORAL_WEB_IMAGE}@${CORAL_WEB_DIGEST}"

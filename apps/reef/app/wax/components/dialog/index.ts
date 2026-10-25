@@ -1,0 +1,28 @@
+import { Dialog as BaseDialog } from '@base-ui/react/dialog'
+
+export { Actions } from './actions'
+export type { ActionsProps } from './actions'
+export { Backdrop } from './backdrop'
+export type { BackdropProps } from './backdrop'
+export { Close } from './close'
+export type { CloseProps } from './close'
+export { Description } from './description'
+export type { DescriptionProps } from './description'
+export { Popup } from './popup'
+export type { PopupProps, PopupSize } from './popup'
+export { Rail } from './rail'
+export type { RailProps } from './rail'
+export { Header } from './header'
+export { Title } from './title'
+export type { TitleProps } from './title'
+export { Trigger } from './trigger'
+export { useCloseAfterExit } from './use-close-after-exit'
+export type { TriggerProps } from './trigger'
+
+export const Portal = BaseDialog.Portal
+export const Root = BaseDialog.Root
+
+/** Pins content to the popup's top edge, flush like `Header`. */
+export { pinned as pinnedClassName } from './dialog.css'
+/** Pins content to the popup's bottom edge. */
+export { pinnedBottom as pinnedBottomClassName } from './dialog.css'

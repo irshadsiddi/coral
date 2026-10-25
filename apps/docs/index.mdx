@@ -1,0 +1,57 @@
+---
+title: "Introduction to Coral"
+description: ""
+---
+
+![Coral cover](/images/cover.png)
+
+Coral allows you to centralise access to <Tooltip tip="GitHub, Slack, Notion, and anything else behind an OpenAPI document or an MCP server.">providers</Tooltip>. It enables more fine-grained access control using policies you define.
+It learns from your usage, and improves itself continuously.
+
+You run Coral yourself. Your data, credentials and usage history stay on your
+machine or on your own server.
+
+## Get started
+
+<Steps titleSize="h3">
+  <Step title="Install Coral">
+    <Tabs>
+      <Tab title="Desktop app">
+        Run Coral on your own machine, for yourself. Download the desktop app
+        for macOS, Windows, or Linux from the
+        [releases page](https://github.com/withcoral/coral-releases/releases).
+
+        [Install the desktop app](/getting-started/install-locally)
+      </Tab>
+
+      <Tab title="Shared server">
+        Run Coral as a server your team signs in to, using Coral's official container images.
+
+        [Run a shared server](/getting-started/self-host)
+      </Tab>
+    </Tabs>
+
+  </Step>
+
+<Step title="Add your providers">
+  Add GitHub, Slack, Datadog, and other providers to your workspace. Your agents
+  can only call operations from providers you've added.
+
+  [Add a provider](/getting-started/quickstart#add-a-provider)
+</Step>
+
+  <Step title="Connect your agents to Coral via MCP">
+    Configure your MCP clients (e.g. Claude Code, Codex) to use the [Coral MCP server](/getting-started/quickstart#connect-an-mcp-client)
+  </Step>
+</Steps>
+
+## Quick links
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/getting-started/quickstart">
+    Add a provider, connect your agent, and ask your first question
+  </Card>
+  <Card title="Concepts" icon="book-open" href="/guides/concepts">
+    Build the right mental model for Coral
+  </Card>
+</CardGroup>

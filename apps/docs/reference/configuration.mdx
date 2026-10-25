@@ -1,0 +1,142 @@
+---
+title: "Configuration Reference"
+sidebarTitle: "Configuration"
+---
+
+Your configuration lives in the `config.toml` file of Coral's configuration folder. By default the folder is located in:
+
+- macOS: `~/Library/Application Support/com.withcoral.coral`
+- Linux: `~/.config/coral`
+- Windows: `%APPDATA%\withcoral\coral\config`
+
+You can override the location of the config folder with the `CORAL_CONFIG_DIR` environment variable.
+
+## General
+
+### `[listeners.grpc]`
+
+| Key    | Description                                | Required | Default       |
+| ------ | ------------------------------------------ | -------- | ------------- |
+| `bind` | Bind address and port for Coral's gRPC API | No       | `127.0.0.1:0` |
+
+### `[listeners.mcp]`
+
+| Key          | Description                                                                                                | Required                  | Default       |
+| ------------ | ---------------------------------------------------------------------------------------------------------- | ------------------------- | ------------- |
+| `bind`       | Bind address and port for Coral's MCP server                                                               | No                        | `127.0.0.1:0` |
+| `public_url` | Public URL of the MCP Server. Must be https or loopback http. May include a port; must not include a path. | Yes, when auth is enabled | N/A           |
+
+### `[listeners.auth]`
+
+| Key          | Description                                                                                                 | Required                  | Default                                                                    |
+| ------------ | ----------------------------------------------------------------------------------------------------------- | ------------------------- | -------------------------------------------------------------------------- |
+| `bind`       | Bind address and port for Coral's auth server                                                               | No                        | `127.0.0.1:0` for a shared server and `127.0.0.1:8779` for the desktop app |
+| `public_url` | Public URL of the Auth Server. Must be https or loopback http. May include a port; must not include a path. | Yes, when auth is enabled | N/A                                                                        |
+
+### `[listeners.web]`
+
+| Key          | Description                                                                                                  | Required                                 | Default |
+| ------------ | ------------------------------------------------------------------------------------------------------------ | ---------------------------------------- | ------- |
+| `public_url` | Public URL of the coral-web UI. Must be https or loopback http. May include a port; must not include a path. | Not if `CORAL_LOCAL_WEB_URL` is provided | N/A     |
+
+### `[credentials]`
+
+| Key       | Description                                                                                                                         | Required                                                                                    | Default |
+| --------- | ----------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------- | ------- |
+| `key_env` | Name of the environment variable that holds the encryption key for provider credentials. Generate it with `openssl rand -base64 32` | No. If not present Coral will autogenerate an encryption key and save it to its config dir. | N/A     |
+
+### `[outbound]`
+
+Controls the policy for outbound calls from Coral to providers.
+Policies can have one of the following values:
+
+- `deny`: Denies all requests to the policy target
+- `https`: Allows only https requests, no plain http.
+- `http-and-https`: Allows both http and https requests.
+
+All provider calls not covered by an explicit policy in this section are treated under the `https` policy.
+
+| Key                | Description                                                   | Required | Default |
+| ------------------ | ------------------------------------------------------------- | -------- | ------- |
+| `loopback`         | Policy for provider calls to loopback addresses.              | No       | `deny`  |
+| `private_networks` | Policy for provider calls to addresses in non-public networks | No       | `deny`  |
+
+### `[runtime]`
+
+| Key                    | Description                                                        | Required | Default |
+| ---------------------- | ------------------------------------------------------------------ | -------- | ------- |
+| `execution_heap_bytes` | Maximum heap bytes allowed for a single V8 isolate                 | No       | 128MiB  |
+| `compiler_heap_bytes`  | Maximum heap bytes allowed for a single Typescript compilation job | No       | 512MiB  |
+
+### `[search]`
+
+| Key                          | Description                                                                         | Required | Default |
+| ---------------------------- | ----------------------------------------------------------------------------------- | -------- | ------- |
+| `reconcile_interval_seconds` | Interval on which provider operation and saved function search indexing is executed | No       | `300`   |
+
+### `[otel]`
+
+Controls telemetry export to an OpenTelemetry endpoint.
+
+| Key            | Description                                                                        | Required | Default                                                                                                                                 |
+| -------------- | ---------------------------------------------------------------------------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `endpoint`     | URL of the http otel endpoint to which telemetry will be sent.                     | No       | N/A                                                                                                                                     |
+| `headers`      | Additional headers sent to the otel endpoint, formatted as `name=value,name=value` | No       | None                                                                                                                                    |
+| `log_filter`   | Filters to apply to logs before otel export                                        | No       | `coral_app=info,coral_grpc=info,coral_mcp=info,coral_search=info,coral_administration=info`                                             |
+| `trace_filter` | Filters to apply to traces before otel export                                      | No       | `coral_app=trace,coral_grpc=trace,coral_mcp=trace,coral_search=trace,coral_administration=trace,coral.http.body=off,coral.mcp.body=off` |
+| `service_name` | Name of the service when exporting OTEL data                                       | No       | `coral`                                                                                                                                 |
+
+## Auth
+
+### `[auth]`
+
+| Key                 | Description                                                                            | Required | Default |
+| ------------------- | -------------------------------------------------------------------------------------- | -------- | ------- |
+| `allowed_audiences` | Array. Additional audiences for which Coral's auth server can mint tokens              | No       | `[]`    |
+| `trusted_clients`   | Array with client ids for which Coral's auth server will not display a consent screen. | No       | `[]`    |
+
+### `[auth.session]`
+
+| Key                        | Description                                                                                                                  | Required                                                                                                   | Default                     |
+| -------------------------- | ---------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- | --------------------------- |
+| `signing_key_env`          | Name of the environment variable holding the key used to sign Coral's auth server tokens. Must be a base64 PKCS#8 P-256 key. | No, but if `[auth]` is present the environment variable must exist or `signing_key_file` must be defined   | `CORAL_SESSION_SIGNING_KEY` |
+| `signing_key_file`         | File path containing the key used to sign Coral's auth server tokens. Must be a PKCS#8 P-256 key in DER format.              | Yes, if `[auth]` section is present and if the environment variable defined in `signing_key_env` is absent | N/A                         |
+| `access_token_ttl_seconds` | Duration of Coral's access tokens, in seconds.                                                                               | No                                                                                                         | `2592000` (720h)            |
+
+### `[auth.provider]`
+
+| Key                       | Description                                                                                                                | Required                                                                                                                  | Default                          |
+| ------------------------- | -------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- | -------------------------------- |
+| `issuer`                  | URL of the OIDC issuer. Must be https.                                                                                     | Yes, if `[auth]` section is present                                                                                       | N/A                              |
+| `client_id`               | Client ID used to connect to the OIDC issuer.                                                                              | Yes, if `[auth]` section is present                                                                                       | N/A                              |
+| `client_secret`           | Client secret used to connect to the OIDC issuer.                                                                          | Yes, if `[auth]` section is present and if `client_secret_env` is absent                                                  | N/A                              |
+| `client_secret_env`       | Name of the environment variable holding the client secret used to connect to the OIDC issuer                              | Yes, if `[auth]` section is present and if `client_secret` is absent                                                      | N/A                              |
+| `scopes`                  | Array of scopes to request to the OIDC Issuer. Must include `openid`                                                       | No                                                                                                                        | `["openid", "email", "profile"]` |
+| `display_name_claim`      | Name of the claim from the OIDC token used for user display names                                                          | No                                                                                                                        | `email`                          |
+| `name_claim`              | Name of the claim from the OIDC token used for user names                                                                  | No                                                                                                                        | `name`                           |
+| `email_claim`             | Name of the claim from the OIDC token used for user emails                                                                 | No                                                                                                                        | `email`                          |
+| `email_verified_claim`    | Name of the claim from the OIDC token used to check if user email is verified                                              | No                                                                                                                        | `email_verified`                 |
+| `bootstrap_owner_subject` | Value of the `sub` claim of the user that will have Coral's organization owner role. Applied at that user's first sign-in. | No, but Org owner admin operations will be disabled if left undefined. Omit the key rather than set it to an empty string | N/A                              |
+| `auth_params`             | Extra parameters that will be passed in the OIDC authorization request                                                     | No                                                                                                                        | `{}`                             |
+| `required_claims`         | Claim values that must be present on the OIDC ID token to allow login into Coral.                                          | No                                                                                                                        | `{}`                             |
+
+Register `<listeners.auth.public_url>/auth/oidc/callback` as the redirect URI at the OIDC issuer.
+
+### `[auth.provider.access_token]`
+
+Optional section that can be used to require certain values on the OIDC's access token.
+
+| Key               | Description                                                                           | Required | Default |
+| ----------------- | ------------------------------------------------------------------------------------- | -------- | ------- |
+| `audience`        | `aud` claim that must be present on the OIDC access token                             | Yes      | N/A     |
+| `required_claims` | Claim values that must be present on the OIDC access token to allow login into Coral. | No       | `{}`    |
+
+## Database
+
+### `[database]`
+
+| Key       | Description                                                                            | Required                             | Default                 |
+| --------- | -------------------------------------------------------------------------------------- | ------------------------------------ | ----------------------- |
+| `backend` | DB backend Coral will use. Either `sqlite` or `postgres`                               | No when the config section is absent | `sqlite`                |
+| `path`    | SQLite only. Path to the db file                                                       | No                                   | `<config dir>/coral.db` |
+| `url_env` | Postgres only. Name of the environment variable that has the connection URL to the DB. | Yes, when `backend` is `postgres`    | N/A                     |

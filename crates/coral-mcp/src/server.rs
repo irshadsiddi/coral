@@ -1,616 +1,791 @@
-//! RMCP server implementation for Coral's stdio MCP surface.
+use std::borrow::Cow;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use coral_api::v1::{
-    CatalogItemKind as ProtoCatalogItemKind, DescribeTableRequest, DescribeTableResponse,
-    ExecuteSqlRequest, ListCatalogRequest, ListCatalogResponse, ListColumnsRequest,
-    ListSourcesRequest, PaginationRequest, SearchCatalogRequest, Source, SubmitFeedbackRequest,
-    TableSummary as ProtoTableSummary, catalog_item,
+use coral_run::{RUN_EVENT_PAGE_MAX, RunCursor, RunId, RunObservation};
+use coral_search::SearchInput;
+use coral_task::{TaskId, TaskIntent, TaskOutcome};
+use coral_workspace::{TraceId, WorkspaceId};
+use rmcp::model::{
+    CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, Implementation,
+    ListResourceTemplatesResult, ListResourcesResult, ListToolsResult, PaginatedRequestParams,
+    ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse, ServerCapabilities,
+    ServerConfig,
 };
-use coral_client::{
-    AppClient, CatalogClient, FeedbackClient, QueryClient, SourceClient, batches_to_json_rows,
-    decode_execute_sql_response, default_workspace,
+use rmcp::service::{MaybeSendFuture, RequestContext, RoleServer};
+use rmcp::{ErrorData, ServerHandler};
+use uuid::Uuid;
+
+use crate::McpRuntime;
+use crate::arguments::{
+    self, CancelArguments, DeleteFunctionArguments, DescribeArguments, EndTaskArguments,
+    ExecArguments, SaveFunctionArguments, SearchArguments, StartTaskArguments, TaskOutcomeArgument,
+    ToolArguments, WaitArguments,
 };
-use rmcp::{
-    ErrorData, ServerHandler,
-    model::{
-        CallToolRequestParams, CallToolResult, Implementation, ListResourcesResult,
-        ListToolsResult, PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResult,
-        ResourceContents, ServerCapabilities, ServerInfo,
-    },
-    service::{RequestContext, RoleServer},
-};
-use serde::Serialize;
-use serde_json::{Map, Value};
-use tonic::Request;
+use crate::projection::{self, ToolFailure};
+use crate::prompts::{Asked, Channel, Prompting};
 
-use crate::{
-    McpOptions,
-    surface::{
-        CatalogToolKind, build_tool_result, describe_table_arguments, describe_table_tool,
-        describe_table_value, feedback_tool, guide_resource, guide_resource_content,
-        initial_instructions, list_catalog_arguments, list_catalog_tool, list_catalog_value,
-        list_columns_arguments, list_columns_tool, list_columns_value, required_string_argument,
-        search_catalog_arguments, search_catalog_tool, search_catalog_value, sql_tool,
-        status_to_error_data, tables_resource, tables_resource_content, tool_error_from_status,
-        tool_error_result,
-    },
-    telemetry,
-};
+#[cfg(test)]
+mod tests;
 
-const LIST_TABLES_COUNT_LIMIT: u32 = 1;
-const LIST_TABLE_FUNCTIONS_COUNT_LIMIT: u32 = 1;
-const LIST_CATALOG_UNBOUNDED_LIMIT: u32 = 0;
-const CATALOG_KIND_ALL: ProtoCatalogItemKind = ProtoCatalogItemKind::Unspecified;
-const CATALOG_KIND_TABLE: ProtoCatalogItemKind = ProtoCatalogItemKind::Table;
-const CATALOG_KIND_TABLE_FUNCTION: ProtoCatalogItemKind = ProtoCatalogItemKind::TableFunction;
+/// MCP protocol versions this Adapter serves, oldest first.
+///
+/// This is the tested window, not everything RMCP knows. `server/discover`
+/// advertises exactly this list. An `initialize` handshake exists only before
+/// 2026-07-28, so a client asking over it for a newer version, or for a legacy
+/// version outside the window, lands on the oldest entry, which is also the
+/// version with the fewest wire obligations. Add a version here only together
+/// with its raw-wire test coverage; drop the oldest once no supported client
+/// sends it.
+pub const SUPPORTED_PROTOCOL_VERSIONS: &[ProtocolVersion] =
+    &[ProtocolVersion::V_2025_11_25, ProtocolVersion::V_2026_07_28];
 
-enum ToolCallOutcome {
-    Success(Value),
-    ToolError {
-        operation: &'static str,
-        status: tonic::Status,
-    },
-}
-
-#[derive(Serialize)]
-struct SqlRowsValue {
-    rows: Vec<Value>,
-}
-
-#[derive(Serialize)]
-struct FeedbackStoredValue {
-    feedback_id: String,
-    created_at: String,
-    message: &'static str,
-}
-
-fn serialize_tool_value(value: impl Serialize) -> Result<Value, tonic::Status> {
-    serde_json::to_value(value).map_err(|error| tonic::Status::internal(error.to_string()))
-}
-
-impl ToolCallOutcome {
-    fn from_value_result(operation: &'static str, result: Result<Value, tonic::Status>) -> Self {
-        match result {
-            Ok(value) => Self::Success(value),
-            Err(status) => Self::ToolError { operation, status },
-        }
-    }
+/// The version an `initialize` handshake lands on when the requested version
+/// is outside the window or, from 2026-07-28, has no such handshake at all.
+fn fallback_protocol_version() -> ProtocolVersion {
+    SUPPORTED_PROTOCOL_VERSIONS
+        .first()
+        .expect("the protocol window is never empty")
+        .clone()
 }
 
 #[derive(Clone)]
-pub(crate) struct CoralMcpServer {
-    source: SourceClient,
-    catalog: CatalogClient,
-    query: QueryClient,
-    feedback: FeedbackClient,
-    options: McpOptions,
+pub(crate) struct McpServer {
+    runtime: McpRuntime,
+    workspace_id: WorkspaceId,
 }
 
-impl CoralMcpServer {
-    pub(crate) fn new(app: &AppClient, options: McpOptions) -> Self {
+impl McpServer {
+    pub(crate) const fn new(runtime: McpRuntime, workspace_id: WorkspaceId) -> Self {
         Self {
-            source: app.source_client(),
-            catalog: app.catalog_client(),
-            query: app.query_client(),
-            feedback: app.feedback_client(),
-            options,
+            runtime,
+            workspace_id,
         }
     }
 
-    async fn load_sources(&self) -> Result<Vec<Source>, tonic::Status> {
-        let mut source_client = self.source.clone();
-        Ok(source_client
-            .list_sources(Request::new(ListSourcesRequest {
-                workspace: Some(default_workspace()),
-            }))
-            .await?
-            .into_inner()
-            .sources)
-    }
-
-    async fn load_catalog(
+    async fn dispatch(
         &self,
-        schema_name: Option<&str>,
-        kind: ProtoCatalogItemKind,
-        pagination: PaginationRequest,
-    ) -> Result<ListCatalogResponse, tonic::Status> {
-        let mut catalog_client = self.catalog.clone();
-        Ok(catalog_client
-            .list_catalog(Request::new(ListCatalogRequest {
-                workspace: Some(default_workspace()),
-                schema_name: schema_name.unwrap_or_default().to_string(),
-                kind: kind as i32,
-                pagination: Some(pagination),
-            }))
-            .await?
-            .into_inner())
-    }
-
-    async fn load_all_table_summaries(&self) -> Result<Vec<ProtoTableSummary>, tonic::Status> {
-        self.load_catalog(
-            None,
-            CATALOG_KIND_TABLE,
-            PaginationRequest {
-                limit: LIST_CATALOG_UNBOUNDED_LIMIT,
-                offset: 0,
-            },
+        mut request: CallToolRequestParams,
+        channel: Channel,
+    ) -> Result<CallToolResponse, DispatchError> {
+        let prompting = Prompting::from_request(
+            channel,
+            request.request_state.take(),
+            request.input_responses.take(),
         )
-        .await
-        .map(|response| {
-            response
-                .items
-                .into_iter()
-                .filter_map(|item| match item.item {
-                    Some(catalog_item::Item::Table(table)) => Some(table),
-                    Some(catalog_item::Item::TableFunction(_)) | None => None,
-                })
-                .collect()
-        })
-    }
-
-    async fn load_guide_catalog(
-        &self,
-    ) -> Result<(Vec<ProtoTableSummary>, Vec<String>), tonic::Status> {
-        self.load_catalog(
-            None,
-            CATALOG_KIND_ALL,
-            PaginationRequest {
-                limit: LIST_CATALOG_UNBOUNDED_LIMIT,
-                offset: 0,
-            },
-        )
-        .await
-        .map(guide_catalog_from_response)
-    }
-
-    async fn load_table_description(
-        &self,
-        schema_name: &str,
-        table_name: &str,
-    ) -> Result<DescribeTableResponse, tonic::Status> {
-        let mut catalog_client = self.catalog.clone();
-        Ok(catalog_client
-            .describe_table(Request::new(DescribeTableRequest {
-                workspace: Some(default_workspace()),
-                schema_name: schema_name.to_string(),
-                table_name: table_name.to_string(),
-            }))
-            .await?
-            .into_inner())
-    }
-
-    async fn load_table_count(&self) -> Result<usize, tonic::Status> {
-        self.load_catalog(
-            None,
-            CATALOG_KIND_TABLE,
-            PaginationRequest {
-                limit: LIST_TABLES_COUNT_LIMIT,
-                offset: 0,
-            },
-        )
-        .await
-        .map(|response| {
-            response
-                .pagination
-                .map_or(0, |pagination| pagination.total_count as usize)
-        })
-    }
-
-    async fn load_table_function_count(&self) -> Result<usize, tonic::Status> {
-        self.load_catalog(
-            None,
-            CATALOG_KIND_TABLE_FUNCTION,
-            PaginationRequest {
-                limit: LIST_TABLE_FUNCTIONS_COUNT_LIMIT,
-                offset: 0,
-            },
-        )
-        .await
-        .map(|response| {
-            response
-                .pagination
-                .map_or(0, |pagination| pagination.total_count as usize)
-        })
-    }
-
-    async fn load_sources_and_catalog_counts(
-        &self,
-    ) -> Result<(Vec<Source>, usize, usize), tonic::Status> {
-        tokio::try_join!(
-            self.load_sources(),
-            self.load_table_count(),
-            self.load_table_function_count()
-        )
-    }
-
-    async fn load_sources_and_guide_catalog(
-        &self,
-    ) -> Result<(Vec<Source>, Vec<ProtoTableSummary>, Vec<String>), tonic::Status> {
-        let (sources, (tables, table_function_schema_names)) =
-            tokio::try_join!(self.load_sources(), self.load_guide_catalog())?;
-        Ok((sources, tables, table_function_schema_names))
-    }
-
-    async fn query_rows(&self, sql: &str) -> Result<Vec<Value>, tonic::Status> {
-        let mut query_client = self.query.clone();
-        let response = query_client
-            .execute_sql(Request::new(ExecuteSqlRequest {
-                workspace: Some(default_workspace()),
-                sql: sql.to_string(),
-            }))
-            .await?
-            .into_inner();
-        let result = decode_execute_sql_response(&response)
-            .map_err(|error| tonic::Status::internal(error.to_string()))?;
-        batches_to_json_rows(result.batches())
-            .map_err(|error| tonic::Status::internal(error.to_string()))
-    }
-
-    async fn execute_sql_value(&self, sql: &str) -> Result<Value, tonic::Status> {
-        serialize_tool_value(SqlRowsValue {
-            rows: self.query_rows(sql).await?,
-        })
-    }
-
-    async fn submit_feedback_value(
-        &self,
-        trying_to_do: &str,
-        tried: &str,
-        stuck: &str,
-    ) -> Result<Value, tonic::Status> {
-        let mut feedback_client = self.feedback.clone();
-        let response = feedback_client
-            .submit_feedback(Request::new(SubmitFeedbackRequest {
-                workspace: Some(default_workspace()),
-                trying_to_do: trying_to_do.to_string(),
-                tried: tried.to_string(),
-                stuck: stuck.to_string(),
-            }))
-            .await?
-            .into_inner();
-        let report = response
-            .report
-            .ok_or_else(|| tonic::Status::internal("feedback response missing report"))?;
-        serialize_tool_value(FeedbackStoredValue {
-            feedback_id: report.id,
-            created_at: report.created_at,
-            message: "Feedback report stored.",
-        })
-    }
-
-    async fn search_catalog_tool_result(
-        &self,
-        request_arguments: Option<&Map<String, Value>>,
-    ) -> Result<ToolCallOutcome, ErrorData> {
-        let arguments = search_catalog_arguments(request_arguments)?;
-        let mut catalog_client = self.catalog.clone();
-        match catalog_client
-            .search_catalog(Request::new(SearchCatalogRequest {
-                workspace: Some(default_workspace()),
-                pattern: arguments.pattern,
-                ignore_case: arguments.ignore_case,
-                schema_name: arguments.schema.unwrap_or_default(),
-                kind: catalog_item_kind_from_tool(arguments.kind) as i32,
-                pagination: Some(PaginationRequest {
-                    limit: arguments.pagination.limit,
-                    offset: arguments.pagination.offset,
-                }),
-            }))
-            .await
-            .map(|response| search_catalog_value(&response.into_inner()))
+        .map_err(invalid_input_message)?;
+        let name = request.name.as_ref();
+        if prompting.continued_run().is_some()
+            && !matches!(name, ExecArguments::NAME | WaitArguments::NAME)
         {
-            Ok(value) => Ok(ToolCallOutcome::Success(value)),
-            Err(status) if status.code() == tonic::Code::InvalidArgument => {
-                Err(status_to_error_data(&status))
-            }
-            Err(status) => Ok(ToolCallOutcome::ToolError {
-                operation: "Catalog search",
-                status,
-            }),
+            return Err(invalid_input_message(format!(
+                "tool '{name}' does not accept requestState"
+            )));
         }
-    }
-
-    async fn list_catalog_tool_result(
-        &self,
-        request_arguments: Option<&Map<String, Value>>,
-    ) -> Result<ToolCallOutcome, ErrorData> {
-        let arguments = list_catalog_arguments(request_arguments)?;
-        let mut catalog_client = self.catalog.clone();
-        let result = catalog_client
-            .list_catalog(Request::new(ListCatalogRequest {
-                workspace: Some(default_workspace()),
-                schema_name: arguments.schema.unwrap_or_default(),
-                kind: catalog_item_kind_from_tool(arguments.kind) as i32,
-                pagination: Some(PaginationRequest {
-                    limit: arguments.pagination.limit,
-                    offset: arguments.pagination.offset,
-                }),
-            }))
-            .await
-            .map(|response| list_catalog_value(&response.into_inner()));
-        Ok(ToolCallOutcome::from_value_result(
-            "Catalog listing",
-            result,
-        ))
-    }
-
-    async fn describe_table_tool_result(
-        &self,
-        request_arguments: Option<&Map<String, Value>>,
-    ) -> Result<ToolCallOutcome, ErrorData> {
-        let arguments = describe_table_arguments(request_arguments)?;
-        match self
-            .load_table_description(&arguments.schema, &arguments.table)
-            .await
-        {
-            Ok(response) => Ok(ToolCallOutcome::Success(describe_table_value(
-                &arguments.schema,
-                &arguments.table,
-                &response,
-            ))),
-            Err(status) => Ok(ToolCallOutcome::ToolError {
-                operation: "Table description",
-                status,
-            }),
-        }
-    }
-
-    async fn dispatch_tool(
-        &self,
-        request: CallToolRequestParams,
-    ) -> Result<ToolCallOutcome, ErrorData> {
-        match request.name.as_ref() {
-            "sql" => {
-                let sql = required_string_argument(request.arguments.as_ref(), "sql")?;
-                Ok(ToolCallOutcome::from_value_result(
-                    "Query",
-                    self.execute_sql_value(&sql).await,
-                ))
+        let complete = match name {
+            StartTaskArguments::NAME => {
+                let arguments = arguments::parse::<StartTaskArguments>(request.arguments)?;
+                self.start_task(arguments).await
             }
-            "list_catalog" => {
-                self.list_catalog_tool_result(request.arguments.as_ref())
-                    .await
+            SearchArguments::NAME => {
+                let arguments = arguments::parse::<SearchArguments>(request.arguments)?;
+                self.search(arguments).await
             }
-            "search_catalog" => {
-                self.search_catalog_tool_result(request.arguments.as_ref())
-                    .await
+            DescribeArguments::NAME => {
+                let arguments = arguments::parse::<DescribeArguments>(request.arguments)?;
+                self.describe(arguments).await
             }
-            "describe_table" => {
-                self.describe_table_tool_result(request.arguments.as_ref())
-                    .await
+            SaveFunctionArguments::NAME => {
+                let arguments = arguments::parse::<SaveFunctionArguments>(request.arguments)?;
+                self.save_function(arguments).await
             }
-            "list_columns" => {
-                self.list_columns_tool_result(request.arguments.as_ref())
-                    .await
+            DeleteFunctionArguments::NAME => {
+                let arguments = arguments::parse::<DeleteFunctionArguments>(request.arguments)?;
+                self.delete_function(arguments).await
             }
-            "feedback" if self.options.feedback_enabled => {
-                let trying_to_do =
-                    required_string_argument(request.arguments.as_ref(), "trying_to_do")?;
-                let tried = required_string_argument(request.arguments.as_ref(), "tried")?;
-                let stuck = required_string_argument(request.arguments.as_ref(), "stuck")?;
-                Ok(ToolCallOutcome::from_value_result(
-                    "Feedback submission",
-                    self.submit_feedback_value(&trying_to_do, &tried, &stuck)
-                        .await,
-                ))
+            ExecArguments::NAME => {
+                let arguments = arguments::parse::<ExecArguments>(request.arguments)?;
+                return self.exec(arguments, prompting).await;
             }
-            _ => Err(ErrorData::invalid_params(
-                format!("tool '{}' not found", request.name),
+            WaitArguments::NAME => {
+                let arguments = arguments::parse::<WaitArguments>(request.arguments)?;
+                return self.wait(arguments, prompting).await;
+            }
+            CancelArguments::NAME => {
+                let arguments = arguments::parse::<CancelArguments>(request.arguments)?;
+                self.cancel(arguments).await
+            }
+            EndTaskArguments::NAME => {
+                let arguments = arguments::parse::<EndTaskArguments>(request.arguments)?;
+                self.end_task(arguments).await
+            }
+            _ => Err(DispatchError::Protocol(ErrorData::invalid_params(
+                format!("tool '{name}' not found"),
                 None,
-            )),
-        }
+            ))),
+        };
+        complete.map(Into::into)
     }
 
-    async fn list_columns_tool_result(
+    async fn start_task(
         &self,
-        request_arguments: Option<&Map<String, Value>>,
-    ) -> Result<ToolCallOutcome, ErrorData> {
-        let arguments = list_columns_arguments(request_arguments)?;
-        let mut catalog_client = self.catalog.clone();
-        match catalog_client
-            .list_columns(Request::new(ListColumnsRequest {
-                workspace: Some(default_workspace()),
-                schema_name: arguments.schema.clone(),
-                table_name: arguments.table.clone(),
-                pattern: arguments.pattern.clone(),
-                ignore_case: arguments.ignore_case,
-                required_only: arguments.required_only,
-                pagination: Some(PaginationRequest {
-                    limit: arguments.pagination.limit,
-                    offset: arguments.pagination.offset,
-                }),
-            }))
+        arguments: StartTaskArguments,
+    ) -> Result<CallToolResult, DispatchError> {
+        let intent = TaskIntent::parse(&arguments.intent).map_err(invalid_input)?;
+        // Read before the Task starts, so a failed read leaves no Task behind.
+        let providers = self
+            .runtime
+            .modules
+            .commands
+            .searchable_providers(&self.runtime.principal, &self.workspace_id)
             .await
-        {
-            Ok(response) => Ok(ToolCallOutcome::Success(list_columns_value(
-                &arguments.schema,
-                &arguments.table,
-                &response.into_inner(),
-            ))),
-            Err(status) if status.code() == tonic::Code::InvalidArgument => {
-                Err(status_to_error_data(&status))
+            .map_err(task_failure)?;
+        let task = self
+            .runtime
+            .modules
+            .tasks
+            .start(
+                &self.runtime.principal,
+                &self.workspace_id,
+                intent,
+                now_unix_nanos()?,
+            )
+            .await
+            .map_err(task_failure)?;
+        projection::success(projection::StartedTask {
+            task_id: task.id().to_string(),
+            providers: providers
+                .iter()
+                .map(|call_root| coral_search::provider_filter_value(call_root).to_string())
+                .collect(),
+        })
+        .map_err(DispatchError::Tool)
+    }
+
+    async fn search(&self, arguments: SearchArguments) -> Result<CallToolResult, DispatchError> {
+        let call = self.attributed_command(&arguments.task_id, &arguments.intent)?;
+        let request = SearchInput {
+            query: arguments.query,
+            provider: arguments.provider,
+            limit: arguments.limit,
+            cursor: arguments.cursor,
+        };
+        let results = self
+            .runtime
+            .modules
+            .commands
+            .search(&call, request)
+            .await
+            .map_err(task_failure)?;
+        projection::search(&results)
+            .and_then(projection::success)
+            .map_err(DispatchError::Tool)
+    }
+
+    async fn describe(
+        &self,
+        arguments: DescribeArguments,
+    ) -> Result<CallToolResult, DispatchError> {
+        let call = self.attributed_command(&arguments.task_id, &arguments.intent)?;
+        let result = self
+            .runtime
+            .modules
+            .commands
+            .describe(
+                &call,
+                &arguments.path,
+                arguments.types.as_deref().unwrap_or_default(),
+            )
+            .await
+            .map_err(task_failure)?;
+        projection::exact_description(&result)
+            .and_then(projection::success)
+            .map_err(DispatchError::Tool)
+    }
+
+    async fn save_function(
+        &self,
+        arguments: SaveFunctionArguments,
+    ) -> Result<CallToolResult, DispatchError> {
+        let call = self.attributed_command(&arguments.task_id, &arguments.intent)?;
+        let function = self
+            .runtime
+            .modules
+            .commands
+            .save_function(
+                &call,
+                &arguments.path,
+                &arguments.description,
+                &arguments.source,
+            )
+            .await
+            .map_err(task_failure)?;
+        projection::saved_function(&function)
+            .and_then(projection::success)
+            .map_err(DispatchError::Tool)
+    }
+
+    async fn delete_function(
+        &self,
+        arguments: DeleteFunctionArguments,
+    ) -> Result<CallToolResult, DispatchError> {
+        let call = self.attributed_command(&arguments.task_id, &arguments.intent)?;
+        self.runtime
+            .modules
+            .commands
+            .delete_function(&call, &arguments.path)
+            .await
+            .map_err(task_failure)?;
+        projection::success(projection::DeletedFunction {
+            call_path: format!("coral.functions.{}", arguments.path),
+        })
+        .map_err(DispatchError::Tool)
+    }
+
+    async fn exec(
+        &self,
+        arguments: ExecArguments,
+        prompting: Prompting,
+    ) -> Result<CallToolResponse, DispatchError> {
+        let call = self.attributed_command(&arguments.task_id, &arguments.intent)?;
+        let timeout = arguments
+            .run_timeout_ms
+            .unwrap_or(arguments::DEFAULT_RUN_TIMEOUT_MS);
+        let wait_ms = validated_wait(arguments.wait_ms.unwrap_or(arguments::DEFAULT_EXEC_WAIT_MS))?;
+        let reread = RunObservation::initial(Duration::ZERO).map_err(invalid_input)?;
+        // A retry answers prompts about the Run this call already started.
+        if let Some(run_id) = prompting.continued_run().cloned() {
+            return self
+                .observe_prompting(&run_id, &reread, &reread, prompting)
+                .await;
+        }
+        let accepted = self
+            .runtime
+            .modules
+            .commands
+            .submit(&call, &arguments.program, timeout)
+            .await
+            .map_err(task_failure)?;
+        if wait_ms == 0 {
+            return self
+                .run_update(&accepted)
+                .map(Into::into)
+                .map_err(DispatchError::Tool);
+        }
+        let observation =
+            RunObservation::initial(Duration::from_millis(wait_ms)).map_err(invalid_input)?;
+        self.observe_prompting(accepted.run_id(), &observation, &reread, prompting)
+            .await
+    }
+
+    async fn wait(
+        &self,
+        arguments: WaitArguments,
+        prompting: Prompting,
+    ) -> Result<CallToolResponse, DispatchError> {
+        let run_id = RunId::parse(&arguments.run_id).map_err(invalid_input)?;
+        let cursor = arguments
+            .cursor
+            .as_deref()
+            .map(RunCursor::parse)
+            .transpose()
+            .map_err(invalid_input)?;
+        let wait_ms = validated_wait(arguments.wait_ms.unwrap_or(arguments::DEFAULT_WAIT_MS))?;
+        let reread =
+            RunObservation::immediate(cursor, RUN_EVENT_PAGE_MAX).map_err(invalid_input)?;
+        // A retry has already waited; it answers and observes immediately.
+        let observation = match prompting.continued_run() {
+            Some(continued) if continued != &run_id => {
+                return Err(invalid_input_message(
+                    "requestState belongs to another Run".into(),
+                ));
             }
-            Err(status) if status.code() == tonic::Code::NotFound => {
-                match self
-                    .load_table_description(&arguments.schema, &arguments.table)
+            Some(_) => reread.clone(),
+            None => reread
+                .clone()
+                .with_wait(Duration::from_millis(wait_ms))
+                .map_err(invalid_input)?,
+        };
+        self.observe_prompting(&run_id, &observation, &reread, prompting)
+            .await
+    }
+
+    /// Observes a Run and asks the client about each current action it can answer.
+    /// Answers go to the Run domain, which decides whether they change anything;
+    /// the returned update is reread after them.
+    async fn observe_prompting(
+        &self,
+        run_id: &RunId,
+        observation: &RunObservation,
+        reread: &RunObservation,
+        mut prompting: Prompting,
+    ) -> Result<CallToolResponse, DispatchError> {
+        let trace = generated_trace_id()?;
+        self.answer_prompts(run_id, prompting.take_answers(), &trace)
+            .await?;
+        let mut update = self.observe(run_id, observation).await?;
+        while prompting.available() && !update.required_actions().is_empty() {
+            let prompts = self
+                .runtime
+                .modules
+                .runs
+                .action_prompts(&self.runtime.principal, &self.workspace_id, run_id)
+                .await
+                .map_err(run_failure)?;
+            let intent = if prompts.is_empty() {
+                None
+            } else {
+                self.runtime
+                    .modules
+                    .tasks
+                    .run_intent(&self.runtime.principal, &self.workspace_id, run_id)
                     .await
-                {
-                    Ok(response) => Ok(ToolCallOutcome::Success(describe_table_value(
-                        &arguments.schema,
-                        &arguments.table,
-                        &response,
-                    ))),
-                    Err(status) => Ok(ToolCallOutcome::ToolError {
-                        operation: "Column listing",
-                        status,
-                    }),
+                    .map_err(task_failure)?
+            };
+            match prompting
+                .ask(
+                    prompts,
+                    run_id,
+                    &self.runtime.modules.human_interface,
+                    intent.as_ref().map(coral_task::TaskIntent::as_str),
+                )
+                .map_err(|_error| DispatchError::Tool(ToolFailure::internal()))?
+            {
+                Asked::Nothing => break,
+                Asked::InputRequired(result) => return Ok(result.into()),
+                Asked::InBand(prompts) => {
+                    for prompt in prompts {
+                        let request = prompt.request().clone();
+                        // Boxed: the watcher holds a whole Run observation.
+                        let withdrawn = Box::pin(self.until_withdrawn(
+                            run_id,
+                            &request,
+                            update.next_cursor().clone(),
+                        ));
+                        // Boxed: it reads the connection through the Account domain.
+                        let connected = Box::pin(self.runtime.modules.runs.connection_connected(
+                            &self.runtime.principal,
+                            &self.workspace_id,
+                            &request,
+                            &trace,
+                        ));
+                        let answer = prompt.ask(withdrawn, connected).await;
+                        // Apply each answer at once: a later prompt may stay open.
+                        self.answer_prompts(run_id, vec![answer], &trace).await?;
+                    }
+                    update = self.observe(run_id, reread).await?;
                 }
             }
-            Err(status) => Ok(ToolCallOutcome::ToolError {
-                operation: "Column listing",
-                status,
-            }),
         }
+        self.run_update(&update)
+            .map(Into::into)
+            .map_err(DispatchError::Tool)
+    }
+
+    /// Completes once `request` is no longer a current action of the Run.
+    /// An unreadable Run never withdraws a prompt; its answer is checked anyway.
+    async fn until_withdrawn(
+        &self,
+        run_id: &RunId,
+        request: &coral_run::RequiredActionRequest,
+        mut cursor: RunCursor,
+    ) {
+        loop {
+            let observation = RunObservation::immediate(Some(cursor), RUN_EVENT_PAGE_MAX).and_then(
+                |observation| observation.with_wait(Duration::from_millis(arguments::MAX_WAIT_MS)),
+            );
+            let Ok(observation) = observation else {
+                return std::future::pending().await;
+            };
+            let Ok(update) = self.observe(run_id, &observation).await else {
+                return std::future::pending().await;
+            };
+            if !update
+                .required_actions()
+                .iter()
+                .any(|action| &action.request == request)
+            {
+                return;
+            }
+            cursor = update.next_cursor().clone();
+        }
+    }
+
+    async fn observe(
+        &self,
+        run_id: &RunId,
+        observation: &RunObservation,
+    ) -> Result<coral_run::RunUpdate, DispatchError> {
+        self.runtime
+            .modules
+            .runs
+            .observe(
+                &self.runtime.principal,
+                &self.workspace_id,
+                run_id,
+                observation,
+            )
+            .await
+            .map_err(run_failure)
+    }
+
+    async fn answer_prompts(
+        &self,
+        run_id: &RunId,
+        answers: Vec<(coral_run::RequiredActionRequest, coral_run::PromptAnswer)>,
+        trace: &TraceId,
+    ) -> Result<(), DispatchError> {
+        for (request, answer) in answers {
+            match self
+                .runtime
+                .modules
+                .runs
+                .answer_action_prompt(
+                    &self.runtime.principal,
+                    &self.workspace_id,
+                    run_id,
+                    &request,
+                    answer,
+                    trace,
+                )
+                .await
+            {
+                // The action ended or was resolved elsewhere while the User
+                // considered it, or its Run Owner stopped before answering:
+                // the reread update shows the recorded state.
+                Ok(()) | Err(coral_run::Error::ApprovalNotFound | coral_run::Error::OwnerLost) => {}
+                Err(error) => return Err(run_failure(error)),
+            }
+        }
+        Ok(())
+    }
+
+    async fn cancel(&self, arguments: CancelArguments) -> Result<CallToolResult, DispatchError> {
+        let run_id = RunId::parse(&arguments.run_id).map_err(invalid_input)?;
+        let cursor = arguments
+            .cursor
+            .as_deref()
+            .map(RunCursor::parse)
+            .transpose()
+            .map_err(invalid_input)?;
+        let observation =
+            RunObservation::immediate(cursor, RUN_EVENT_PAGE_MAX).map_err(invalid_input)?;
+        let update = self
+            .runtime
+            .modules
+            .runs
+            .cancel(
+                &self.runtime.principal,
+                &self.workspace_id,
+                &run_id,
+                &observation,
+            )
+            .await
+            .map_err(run_failure)?;
+        self.run_update(&update).map_err(DispatchError::Tool)
+    }
+
+    async fn end_task(&self, arguments: EndTaskArguments) -> Result<CallToolResult, DispatchError> {
+        let task_id = TaskId::parse(&arguments.task_id).map_err(invalid_input)?;
+        let outcome = match arguments.outcome {
+            TaskOutcomeArgument::Success => TaskOutcome::Success,
+            TaskOutcomeArgument::Failure => TaskOutcome::Failure,
+        };
+        let task = self
+            .runtime
+            .modules
+            .tasks
+            .end(
+                &self.runtime.principal,
+                &self.workspace_id,
+                &task_id,
+                outcome,
+                arguments.feedback.as_deref(),
+                now_unix_nanos()?,
+            )
+            .await
+            .map_err(task_failure)?;
+        let durable_outcome = task
+            .outcome()
+            .ok_or_else(|| DispatchError::Tool(ToolFailure::internal()))?;
+        projection::success(projection::EndedTask {
+            task_id: task.id().to_string(),
+            outcome: durable_outcome.into(),
+        })
+        .map_err(DispatchError::Tool)
+    }
+
+    fn run_update(&self, update: &coral_run::RunUpdate) -> Result<CallToolResult, ToolFailure> {
+        let modules = &self.runtime.modules;
+        projection::run_update(
+            update,
+            &modules.human_interface,
+            modules.run_update_page_bytes.get(),
+        )
+    }
+
+    fn attributed_command(
+        &self,
+        task_id: &str,
+        intent: &str,
+    ) -> Result<coral_task::AttributedCommand, DispatchError> {
+        Ok(coral_task::AttributedCommand::new(
+            self.runtime.principal.clone(),
+            self.workspace_id.clone(),
+            TaskId::parse(task_id).map_err(invalid_input)?,
+            TaskIntent::parse(intent).map_err(invalid_input)?,
+            generated_trace_id()?,
+        ))
     }
 }
 
-impl ServerHandler for CoralMcpServer {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
+impl ServerHandler for McpServer {
+    fn get_info(&self) -> ServerConfig {
+        // Embedded output blocks are `resource` content, and the spec asks servers
+        // that send them to declare resources. Nothing is listed or readable.
+        ServerConfig::new(
             ServerCapabilities::builder()
-                .enable_resources()
                 .enable_tools()
+                .enable_resources()
                 .build(),
         )
-        .with_server_info(Implementation::new("coral", env!("CARGO_PKG_VERSION")))
-        .with_instructions(initial_instructions())
+        .with_protocol_version(fallback_protocol_version())
+        .with_server_info(Implementation::new("Coral", env!("CARGO_PKG_VERSION")))
+        .with_instructions(crate::instructions::INSTRUCTIONS)
     }
 
-    async fn list_tools(
-        &self,
-        _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
-    ) -> Result<ListToolsResult, ErrorData> {
-        let span = telemetry::list_tools_span(self.options.trace_parent.as_deref());
-        telemetry::instrument_protocol(span, async {
-            let (visible_table_count, visible_function_count) =
-                tokio::try_join!(self.load_table_count(), self.load_table_function_count())
-                    .map_err(|status| status_to_error_data(&status))?;
-            let mut tools = vec![
-                sql_tool(visible_table_count),
-                list_catalog_tool(visible_table_count, visible_function_count),
-                search_catalog_tool(visible_table_count, visible_function_count),
-                describe_table_tool(),
-                list_columns_tool(),
-            ];
-            if self.options.feedback_enabled {
-                tools.push(feedback_tool());
-            }
-            Ok(ListToolsResult::with_all_items(tools))
-        })
-        .await
+    fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
+        Cow::Borrowed(SUPPORTED_PROTOCOL_VERSIONS)
     }
 
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, ErrorData> {
-        let span =
-            telemetry::call_tool_span(request.name.as_ref(), self.options.trace_parent.as_deref());
-        let outcome = telemetry::instrument(span.clone(), self.dispatch_tool(request)).await;
-        finish_tool_call(&span, outcome)
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        match self.dispatch(request, Channel::negotiate(&context)).await {
+            Ok(response) => Ok(response),
+            Err(DispatchError::Tool(error)) => Ok(projection::failure(&error).into()),
+            Err(DispatchError::Protocol(error)) => Err(error),
+        }
     }
 
-    async fn list_resources(
+    fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
-    ) -> Result<ListResourcesResult, ErrorData> {
-        let span = telemetry::list_resources_span(self.options.trace_parent.as_deref());
-        telemetry::instrument_protocol(span, async {
-            let (sources, visible_table_count, visible_function_count) = self
-                .load_sources_and_catalog_counts()
-                .await
-                .map_err(|status| status_to_error_data(&status))?;
-            Ok(ListResourcesResult::with_all_items(vec![
-                guide_resource(&sources, visible_table_count, visible_function_count),
-                tables_resource(visible_table_count),
-            ]))
-        })
-        .await
+    ) -> impl Future<Output = Result<ListToolsResult, ErrorData>> + MaybeSendFuture + '_ {
+        // Protocol 2026-07-28 (SEP-2549) requires cache hints on list results
+        // and Claude Code rejects a tools/list result that omits them. Older
+        // versions ignore the extra fields, so the hints are not version-gated.
+        std::future::ready(Ok(ListToolsResult::with_all_items(arguments::tools())
+            .with_ttl_ms(0)
+            .with_cache_scope(CacheScope::Private)))
     }
 
-    async fn read_resource(
+    // Embedded output URIs label one result's blocks; they are never listed or read.
+    fn list_resources(
         &self,
-        request: ReadResourceRequestParams,
+        _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
-    ) -> Result<ReadResourceResult, ErrorData> {
-        let span = telemetry::read_resource_span(
-            request.uri.as_str(),
-            self.options.trace_parent.as_deref(),
-        );
-        telemetry::instrument_protocol(span, async {
-            match request.uri.as_str() {
-                "coral://guide" => {
-                    let (sources, tables, table_function_schema_names) = self
-                        .load_sources_and_guide_catalog()
-                        .await
-                        .map_err(|status| status_to_error_data(&status))?;
-                    Ok(ReadResourceResult::new(vec![
-                        ResourceContents::text(
-                            guide_resource_content(&sources, &tables, &table_function_schema_names),
-                            request.uri,
-                        )
-                        .with_mime_type("text/markdown"),
-                    ]))
-                }
-                "coral://tables" => {
-                    let tables = self
-                        .load_all_table_summaries()
-                        .await
-                        .map_err(|status| status_to_error_data(&status))?;
-                    let text = tables_resource_content(&tables)
-                        .map_err(|error| ErrorData::internal_error(error.to_string(), None))?;
-                    Ok(ReadResourceResult::new(vec![
-                        ResourceContents::text(text, request.uri)
-                            .with_mime_type("application/json"),
-                    ]))
-                }
-                _ => Err(ErrorData::resource_not_found(
-                    format!("resource '{}' not found", request.uri),
-                    None,
-                )),
-            }
-        })
-        .await
+    ) -> impl Future<Output = Result<ListResourcesResult, ErrorData>> + MaybeSendFuture + '_ {
+        std::future::ready(Ok(ListResourcesResult::with_all_items(Vec::new())
+            .with_ttl_ms(0)
+            .with_cache_scope(CacheScope::Private)))
+    }
+
+    fn read_resource(
+        &self,
+        _request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<ReadResourceResponse, ErrorData>> + MaybeSendFuture + '_ {
+        std::future::ready(Err(ErrorData::resource_not_found(
+            "Resource not found",
+            None,
+        )))
+    }
+
+    fn list_resource_templates(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<ListResourceTemplatesResult, ErrorData>> + MaybeSendFuture + '_
+    {
+        std::future::ready(Ok(ListResourceTemplatesResult::with_all_items(Vec::new())
+            .with_ttl_ms(0)
+            .with_cache_scope(CacheScope::Private)))
     }
 }
 
-fn finish_tool_call(
-    span: &tracing::Span,
-    outcome: Result<ToolCallOutcome, ErrorData>,
-) -> Result<CallToolResult, ErrorData> {
-    match outcome {
-        Ok(ToolCallOutcome::Success(value)) => {
-            let result = build_tool_result(value);
-            telemetry::record_protocol_result(span, &result);
-            result
+fn validated_wait(wait_ms: u64) -> Result<u64, DispatchError> {
+    if wait_ms > arguments::MAX_WAIT_MS {
+        return Err(invalid_input_message(format!(
+            "wait_ms must be at most {}",
+            arguments::MAX_WAIT_MS
+        )));
+    }
+    Ok(wait_ms)
+}
+
+fn now_unix_nanos() -> Result<i64, DispatchError> {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_error| DispatchError::Tool(ToolFailure::internal()))?;
+    i64::try_from(duration.as_nanos())
+        .map_err(|_error| DispatchError::Tool(ToolFailure::internal()))
+}
+
+fn generated_trace_id() -> Result<TraceId, DispatchError> {
+    TraceId::parse(&Uuid::new_v4().simple().to_string())
+        .map_err(|_error| DispatchError::Tool(ToolFailure::internal()))
+}
+
+fn invalid_input(error: impl std::fmt::Display) -> DispatchError {
+    invalid_input_message(error.to_string())
+}
+
+fn invalid_input_message(message: String) -> DispatchError {
+    DispatchError::Protocol(ErrorData::invalid_params(message, None))
+}
+
+fn task_failure(error: coral_task::Error) -> DispatchError {
+    let failure = match error {
+        coral_task::Error::InvalidInput(message) => ToolFailure::safe("invalid_input", message),
+        coral_task::Error::TaskNotFound => {
+            ToolFailure::stable("task_not_found", "Task was not found")
         }
-        Ok(ToolCallOutcome::ToolError { operation, status }) => {
-            telemetry::record_tonic_status(span, &status);
-            Ok(tool_error_result(tool_error_from_status(
-                operation, &status,
-            )))
+        coral_task::Error::WorkspaceNotFound => {
+            ToolFailure::stable("workspace_not_found", "Workspace was not found")
         }
-        Err(error) => {
-            telemetry::record_protocol_error(span, &error);
-            Err(error)
+        coral_task::Error::PermissionDenied(_) => {
+            ToolFailure::stable("permission_denied", "Permission was denied")
         }
+        coral_task::Error::Workspace(error) => workspace_tool_failure(error),
+        coral_task::Error::Search(error) => return search_failure(error),
+        coral_task::Error::Functions(error) => return functions_failure(error),
+        coral_task::Error::Run(error) => return run_failure(error),
+        coral_task::Error::TaskClosed => {
+            ToolFailure::stable("task_closed", "Task is closed to new attempts")
+        }
+        coral_task::Error::InteractionNotFound => {
+            ToolFailure::stable("interaction_not_found", "Task Interaction was not found")
+        }
+        coral_task::Error::SnapshotTooLarge => ToolFailure::stable(
+            "snapshot_too_large",
+            "Complete discovery snapshot exceeds its limit",
+        ),
+        coral_task::Error::Clock
+        | coral_task::Error::IdentifierIssuance(_)
+        | coral_task::Error::CorruptData(_)
+        | coral_task::Error::Database(_) => ToolFailure::internal(),
+    };
+    DispatchError::Tool(failure)
+}
+
+fn search_failure(error: coral_search::Error) -> DispatchError {
+    if let Some((code, message)) = error.safe_rejection() {
+        return DispatchError::Tool(ToolFailure::safe(code, message));
+    }
+    let failure = match error {
+        coral_search::Error::PermissionDenied(_) => {
+            ToolFailure::stable("permission_denied", "Permission was denied")
+        }
+        coral_search::Error::Workspace(error) => workspace_tool_failure(error),
+        coral_search::Error::Functions(error) => return functions_failure(error),
+        _ => ToolFailure::internal(),
+    };
+    DispatchError::Tool(failure)
+}
+
+fn functions_failure(error: coral_functions::Error) -> DispatchError {
+    use coral_functions::Error;
+    if let Some((code, message)) = error.safe_rejection() {
+        return DispatchError::Tool(ToolFailure::safe(code, message));
+    }
+    let failure = match error {
+        Error::Workspace(error) => workspace_tool_failure(error),
+        _ => ToolFailure::internal(),
+    };
+    DispatchError::Tool(failure)
+}
+
+fn run_failure(error: coral_run::Error) -> DispatchError {
+    if let Some((code, message)) = error.safe_rejection() {
+        return DispatchError::Tool(ToolFailure::safe(code, message));
+    }
+    let failure = match error {
+        coral_run::Error::RunNotFound => {
+            ToolFailure::stable("run_not_found", "Program Run was not found")
+        }
+        coral_run::Error::OwnerLost => ToolFailure::stable(
+            "run_owner_lost",
+            "Program Run outcome is unknown; read the Run again",
+        ),
+        coral_run::Error::OwnedElsewhere => ToolFailure::stable(
+            "run_owned_elsewhere",
+            "Program Run has no live owner in this process; retry",
+        ),
+        coral_run::Error::Functions(error) => return functions_failure(error),
+        coral_run::Error::ProgramValueTooLarge => ToolFailure::stable(
+            "program_value_too_large",
+            "Program Final Value is too large",
+        ),
+        coral_run::Error::InvocationRejected(failure) => {
+            ToolFailure::safe("invocation_rejected", failure.message())
+        }
+        coral_run::Error::Workspace(error) => workspace_tool_failure(error),
+        _ => ToolFailure::internal(),
+    };
+    DispatchError::Tool(failure)
+}
+
+fn workspace_tool_failure(error: coral_workspace::Error) -> ToolFailure {
+    match error {
+        coral_workspace::Error::InvalidInput(message) => {
+            ToolFailure::safe("invalid_input", message)
+        }
+        coral_workspace::Error::WorkspaceNotFound => {
+            ToolFailure::stable("workspace_not_found", "Workspace was not found")
+        }
+        coral_workspace::Error::WorkspaceArchived => {
+            ToolFailure::stable("workspace_archived", "Workspace is archived")
+        }
+        coral_workspace::Error::PermissionDenied(_)
+        | coral_workspace::Error::AgentNotFound
+        | coral_workspace::Error::InvalidAgentCredential => {
+            ToolFailure::stable("permission_denied", "Permission was denied")
+        }
+        coral_workspace::Error::AgentDisabled => {
+            ToolFailure::stable("agent_disabled", "Agent is disabled")
+        }
+        coral_workspace::Error::AgentRegistrationExpired => ToolFailure::stable(
+            "agent_registration_expired",
+            "Agent Registration has expired",
+        ),
+        coral_workspace::Error::OrganizationAuthorityConflict
+        | coral_workspace::Error::EtagMismatch
+        | coral_workspace::Error::RequestAlreadyApplied
+        | coral_workspace::Error::CredentialGeneration
+        | coral_workspace::Error::WorkspaceAlreadyActive
+        | coral_workspace::Error::WorkspaceAlreadyArchived
+        | coral_workspace::Error::MembershipAlreadyExists
+        | coral_workspace::Error::MembershipNotFound
+        | coral_workspace::Error::LastWorkspaceOwner
+        | coral_workspace::Error::OwnerTransferRequired
+        | coral_workspace::Error::OwnerTargetNotEnabled
+        | coral_workspace::Error::CorruptData(_)
+        | coral_workspace::Error::Database(_)
+        | coral_workspace::Error::EventFields(_)
+        | coral_workspace::Error::AmbiguousEmail => ToolFailure::internal(),
     }
 }
 
-fn catalog_item_kind_from_tool(kind: Option<CatalogToolKind>) -> ProtoCatalogItemKind {
-    match kind {
-        None => CATALOG_KIND_ALL,
-        Some(CatalogToolKind::Table) => CATALOG_KIND_TABLE,
-        Some(CatalogToolKind::TableFunction) => CATALOG_KIND_TABLE_FUNCTION,
-    }
+enum DispatchError {
+    Protocol(ErrorData),
+    Tool(ToolFailure),
 }
 
-fn guide_catalog_from_response(
-    response: ListCatalogResponse,
-) -> (Vec<ProtoTableSummary>, Vec<String>) {
-    let mut tables = Vec::new();
-    let mut table_function_schema_names = Vec::new();
-    for item in response.items {
-        match item.item {
-            Some(catalog_item::Item::Table(table)) => tables.push(table),
-            Some(catalog_item::Item::TableFunction(function)) => {
-                table_function_schema_names.push(function.schema_name);
-            }
-            None => {}
-        }
+impl From<ErrorData> for DispatchError {
+    fn from(error: ErrorData) -> Self {
+        Self::Protocol(error)
     }
-    (tables, table_function_schema_names)
 }

@@ -1,0 +1,29 @@
+name: Set up Rust
+description: >-
+  Installs the toolchain from rust-toolchain.toml and restores the Rust build
+  cache. Pull requests restore the cache but never save it, so untrusted code
+  cannot poison what later runs restore. release.yml builds from a clean state
+  and does not use this action.
+
+inputs:
+  cache-key:
+    description: Names the cache. Jobs that build the same targets share a key.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Install Rust toolchain
+      shell: bash
+      run: rustup show
+
+    # Unreleased main: v2.9.2 and earlier prune only the first stale entry of a
+    # partially restored target dir. That can drop a crate's build-script
+    # output and keep its fingerprint, so the link fails (Swatinem/rust-cache#377).
+    - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # main after v2.9.2
+      with:
+        # Bump to drop every saved cache.
+        prefix-key: v1-rust
+        shared-key: ${{ inputs.cache-key }}
+        cache-on-failure: true
+        save-if: ${{ github.event_name != 'pull_request' }}

@@ -1,0 +1,29 @@
+# yaml-language-server: $schema=../schema.json
+# Official provider documentation: https://platform.claude.com/docs/en/api/overview
+# Anthropic publishes no OpenAPI document at a URL of its own. Its official
+# SDKs bundle the full document, gzipped, at scripts/mock-spec.json.gz.
+# API endpoint destinations in this document are https://api.anthropic.com.
+schema_version: 1
+id: claude
+display_name: Claude
+description: Messages, models, files, batches and workspace administration from Anthropic.
+source:
+  openapi:
+    url: https://raw.githubusercontent.com/anthropics/anthropic-sdk-python/main/scripts/mock-spec.json.gz
+authentication:
+  options:
+    api_key:
+      method: header_credentials
+      label: Paste an API key
+      documentation_url: https://platform.claude.com/docs/en/api/overview
+      fields:
+        api_key:
+          label: API key
+      headers:
+        x-api-key:
+          field: api_key
+  default: api_key
+request_headers:
+  anthropic-version: 2023-06-01
+icons:
+  light: logo.svg

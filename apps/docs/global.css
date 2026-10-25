@@ -1,0 +1,10 @@
+:root,
+[data-theme="light"] {
+  --text-color: rgba(0, 0, 0, 0.87);
+  --background-color: #f0f0f0;
+}
+
+[data-theme="dark"] {
+  --text-color: rgba(255, 255, 255, 0.93);
+  --background-color: #191919;
+}

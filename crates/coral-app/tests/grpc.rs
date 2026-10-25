@@ -5,15 +5,15 @@
     reason = "Integration tests inherit the library crate's dependency set and intentionally exercise only a subset of it."
 )]
 
-#[path = "grpc/catalog_discovery_tests.rs"]
-mod catalog_discovery_tests;
-#[path = "grpc/harness.rs"]
-mod harness;
-#[path = "grpc/oauth_refresh_tests.rs"]
-mod oauth_refresh_tests;
-#[path = "grpc/resilience_tests.rs"]
-mod resilience_tests;
+#[path = "grpc/health_service_tests.rs"]
+mod health_service_tests;
+#[path = "grpc/oidc_login_tests.rs"]
+mod oidc_login_tests;
+#[path = "grpc/private_access_tests.rs"]
+mod private_access_tests;
+#[path = "grpc/record_locations_tests.rs"]
+mod record_locations_tests;
 #[path = "grpc/server_lifecycle_tests.rs"]
 mod server_lifecycle_tests;
-#[path = "grpc/source_lifecycle_tests.rs"]
-mod source_lifecycle_tests;
+#[path = "grpc/session_auth.rs"]
+mod session_auth;
